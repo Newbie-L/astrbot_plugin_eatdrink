@@ -26,34 +26,34 @@ class RandomFoodDrinkPlugin(Star):
         logger.info("随机推荐插件初始化完成～")
 
     # 推荐吃的指令
-    @filter.command("吃什么", alias={"推荐吃的", "随机吃"})
+    @filter.command("吃什么", alias={"推荐吃的", "吃点啥"})
     async def recommend_food(self, event: AstrMessageEvent):
         '''发送 /吃什么 随机获取美食建议'''
         random_food = random.choice(FOOD_LIST)
         logger.info(f"为用户 {event.get_sender_name()} 推荐美食：{random_food}")
-        yield event.plain_result(f"🍚 推荐你吃：{random_food}\n（发送 /吃什么 可重新随机）")
+        yield event.plain_result(f"🍚 推荐你吃：{random_food}\n（发送 /吃什么 可重新随")
 
     # 推荐喝的指令
-    @filter.command("喝什么", alias={"推荐喝的", "随机喝"})
+    @filter.command("喝什么", alias={"推荐喝的", "喝点啥"})
     async def recommend_drink(self, event: AstrMessageEvent):
-        '''发送 /什么 随机获取饮品建议'''
+        '''发送 /喝什么 随机获取饮品建议'''
         random_drink = random.choice(DRINK_LIST)
         logger.info(f"为用户 {event.get_sender_name()} 推荐饮品：{random_drink}")
-        yield event.plain_result(f"🥤 推荐你喝：{random_drink}\n（发送 /推什么 可重新随机）")
+        yield event.plain_result(f"🥤 推荐你喝：{random_drink}")
 
     # 合并指令（可选，支持 /推荐 吃的/喝的 格式）
-    @filter.command("推荐")
-    async def recommend_all(self, event: AstrMessageEvent, type_str: str):
-        '''发送 /推荐 吃的 或 /推荐 喝的，获取对应推荐'''
-        type_str = type_str.strip()
-        if type_str in ["吃的", "吃", "美食"]:
-            random_food = random.choice(FOOD_LIST)
-            yield event.plain_result(f"🍚 推荐你吃：{random_food}")
-        elif type_str in ["喝的", "喝", "饮品"]:
-            random_drink = random.choice(DRINK_LIST)
-            yield event.plain_result(f"🥤 推荐你喝：{random_drink}")
-        else:
-            yield event.plain_result("❌ 格式错误！请输入：\n/推荐 吃的\n或\n/推荐 喝的")
+    @filter.command("吃喝什么")
+    async def recommend_food_drink(self, event: AstrMessageEvent):
+        '''发送 吃喝什么 随机获取一组美食+饮品搭配'''
+        random_food = random.choice(FOOD_LIST)
+        random_drink = random.choice(DRINK_LIST)
+        logger.info(f"为用户 {event.get_sender_name()} 推荐搭配：{random_food} + {random_drink}")
+        yield event.plain_result(
+            f"🍽️  吃喝搭配推荐：\n"
+            f"主食：{random_food}\n"
+            f"饮品：{random_drink}\n"
+            f"（发送 吃喝什么 可重新随机搭配）"
+        )
 
     async def terminate(self):
         '''插件卸载时执行'''
