@@ -3,7 +3,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 import random
 
-# 美食/饮品候选列表（可自行扩展）
+
 FOOD_LIST = [
     # 中餐家常菜
     "宫保鸡丁", "鱼香肉丝", "麻婆豆腐", "回锅肉", "番茄炒蛋", "清炒时蔬",
@@ -18,7 +18,7 @@ FOOD_LIST = [
     "盖浇饭", "煲仔饭", "卤肉饭", "蛋炒饭", "炒河粉", "炒米粉", "砂锅", "冒菜"
 ]
 
-# 扩容后的饮品候选列表（覆盖奶茶、咖啡、茶饮、果汁等多类型）
+
 DRINK_LIST = [
     # 奶茶/奶饮
     "珍珠奶茶", "波霸奶茶", "芋圆奶茶", "奶盖茶", "杨枝甘露", "烧仙草",
@@ -39,7 +39,7 @@ DRINK_LIST = [
     "astrbot_plugin_eat-drink", 
     "Cybercat",
     "随机推荐吃什么、喝什么，选择困难症救星～", 
-    "1.0.0",
+    "1.0.1",
     "https://github.com/Newbie-L/astrbot_plugin_eat-drink"
 )
 class RandomFoodDrinkPlugin(Star):
@@ -53,7 +53,7 @@ class RandomFoodDrinkPlugin(Star):
         '''发送 /吃什么 随机获取美食建议'''
         random_food = random.choice(FOOD_LIST)
         logger.info(f"为用户 {event.get_sender_name()} 推荐美食：{random_food}")
-        yield event.plain_result(f"🍚 推荐你吃：{random_food}\n（发送 /吃什么 可重新随")
+        yield event.plain_result(f"🍚 推荐你吃：{random_food}")
 
     # 推荐喝的指令
     @filter.command("喝什么", alias={"推荐喝的", "喝点啥"})
@@ -63,10 +63,10 @@ class RandomFoodDrinkPlugin(Star):
         logger.info(f"为用户 {event.get_sender_name()} 推荐饮品：{random_drink}")
         yield event.plain_result(f"🥤 推荐你喝：{random_drink}")
 
-    # 合并指令（可选，支持 /推荐 吃的/喝的 格式）
+    # 合并指令（可选，支持 /吃喝什么 格式）
     @filter.command("吃喝什么")
     async def recommend_food_drink(self, event: AstrMessageEvent):
-        '''发送 吃喝什么 随机获取一组美食+饮品搭配'''
+        '''发送 /吃喝什么 随机获取一组美食+饮品搭配'''
         random_food = random.choice(FOOD_LIST)
         random_drink = random.choice(DRINK_LIST)
         logger.info(f"为用户 {event.get_sender_name()} 推荐搭配：{random_food} + {random_drink}")
@@ -74,7 +74,6 @@ class RandomFoodDrinkPlugin(Star):
             f"🍽️  吃喝搭配推荐：\n"
             f"主食：{random_food}\n"
             f"饮品：{random_drink}\n"
-            f"（发送 吃喝什么 可重新随机搭配）"
         )
 
     async def terminate(self):
