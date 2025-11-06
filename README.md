@@ -1,14 +1,14 @@
 <div align="center">
 
-# astrbot\_plugin\_eat-drink
+# astrbot\_plugin\_eatdrink
 
-**[用于随机推荐吃什么 喝什么 或是 吃喝什么一起] 推荐食物插件**
+**[用于随机推荐吃什么 喝什么 或是 吃喝什么一起]  食物推荐插件**
 
 </div>
 
 ## 简介
 
-`astrbot_plugin_eat-drink` 是一个随机推荐吃喝什么的插件。
+`astrbot_plugin_eatdrink` 是一个随机推荐吃喝什么的插件。
 
 ## 功能&教程
 
