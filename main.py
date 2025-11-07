@@ -9,14 +9,15 @@ import os
     "astrbot_plugin_eatdrink", 
     "Cybercat",
     "随机推荐吃什么、喝什么，选择困难症救星～", 
-    "1.2.0",  # 版本号升级
+    "1.2.0", 
     "https://github.com/Newbie-L/astrbot_plugin_eatdrink"
 )
 class RandomFoodDrinkPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.data_dir = StarTools.get_data_dir(self)
+        self.data_dir = StarTools.get_data_dir("astrbot_plugin_eatdrink")
         os.makedirs(self.data_dir, exist_ok=True)
+
         self.food_list = self._load_list("food.txt")
         self.drink_list = self._load_list("drink.txt")
         
