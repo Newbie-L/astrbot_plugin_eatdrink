@@ -1,7 +1,7 @@
-name: astrbot_plugin_eatdrink # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
-display_name: 吃喝什么呢？ # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
-desc: 用于随机推荐吃什么，喝什么。 # 插件简短描述
-version: v1.1.0 # 插件版本号。格式：v1.1.1 或者 v1.1
-author: Cybercat # 作者
-repo: https://github.com/Newbie-L/astrbot_plugin_eatdrink # 插件的仓库地址
-tags: [美食, 推荐, 工具] # 插件标签列表，可选
+name: astrbot_plugin_eatdrink
+display_name: 吃喝什么呢？
+desc: 用于随机推荐吃什么，喝什么。 
+version: v1.2.0 
+author: Cybercat
+repo: https://github.com/Newbie-L/astrbot_plugin_eatdrink 
+tags: [美食, 推荐, 工具]
