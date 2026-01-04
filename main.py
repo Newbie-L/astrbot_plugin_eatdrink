@@ -10,7 +10,7 @@ from pathlib import Path
     "astrbot_plugin_eatdrink",
     "Cybercat",
     "随机推荐吃什么、喝什么的插件",
-    "1.2.1",
+    "1.2.2",
     "https://github.com/Newbie-L/astrbot_plugin_eatdrink"
 )
 class RandomFoodDrinkPlugin(Star):

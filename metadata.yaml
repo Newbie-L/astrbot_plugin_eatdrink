@@ -1,7 +1,7 @@
 name: astrbot_plugin_eatdrink
 display_name: 吃喝什么呢？
 desc: 用于随机推荐吃什么，喝什么。 
-version: v1.2.1 
+version: v1.2.2 
 author: Cybercat
 repo: https://github.com/Newbie-L/astrbot_plugin_eatdrink 
 tags: [美食, 推荐, 工具]
