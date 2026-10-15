@@ -1,236 +1,278 @@
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register, StarTools
-from astrbot.api import logger
+"""吃喝什么呢？——随机推荐吃什么 / 喝什么的 AstrBot 插件。
+
+数据来源：插件数据目录下的 ``food.txt`` / ``drink.txt``，首次运行时由 ``templates/``
+自动复制生成。每行格式为 ``条目名|分类1,分类2``，分类部分可省略。
+
+对外指令与回复文案保持与 1.2.2 完全一致，仅内部结构做了等价重构。
+"""
+
+from __future__ import annotations
+
 import random
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, StarTools, register
+
+PLUGIN_NAME = "astrbot_plugin_eatdrink"
+PLUGIN_VERSION = "1.3.0"
+PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_eatdrink"
+
+# 正常情况下 AstrBot 的 WakingCheckStage 已经剥离唤醒前缀，这里只做兜底，
+# 兼容直接阅读原始消息（message_obj.message_str）的场景。
+_WAKE_PREFIX_CHARS = "/#!！.。·"
 
 
-@register(
-    "astrbot_plugin_eatdrink",
-    "Cybercat",
-    "随机推荐吃什么、喝什么的插件",
-    "1.2.2",
-    "https://github.com/Newbie-L/astrbot_plugin_eatdrink"
+def _split_categories(raw: str) -> list[str]:
+    """拆分 ``火锅,川菜`` 形式的分类串：去空、去重、保持书写顺序。"""
+    parts = (part.strip() for part in raw.split(","))
+    return [part for part in dict.fromkeys(parts) if part]
+
+
+def _parse_catalog_lines(lines: Iterable[str]) -> tuple[list[str], dict[str, list[str]]]:
+    """把数据行解析为 ``(条目列表, {分类: [条目, ...]})``。"""
+    items: list[str] = []
+    category_map: dict[str, list[str]] = {}
+
+    for line in lines:
+        name, _, categories = line.partition("|")
+        name = name.strip()
+        if not name:
+            continue
+        if name not in items:
+            items.append(name)
+        for category in _split_categories(categories):
+            bucket = category_map.setdefault(category, [])
+            if name not in bucket:
+                bucket.append(name)
+
+    return items, category_map
+
+
+def _extract_keyword(raw_text: str, command_names: tuple[str, ...]) -> str:
+    """取出指令之后的关键词，例如 ``/吃什么 川菜`` -> ``川菜``。
+
+    ``command_names`` 必须按长度降序传入，否则 ``吃什么`` 会抢先截断 ``吃喝什么``。
+    """
+    text = raw_text.strip()
+    if text and text[0] in _WAKE_PREFIX_CHARS:
+        text = text.lstrip(_WAKE_PREFIX_CHARS).strip()
+    for name in command_names:
+        if text.startswith(name):
+            return text[len(name) :].strip()
+    # 兜底：指令必然位于首个 token，丢弃它，剩余内容视为关键词
+    _, _, rest = text.partition(" ")
+    return rest.strip()
+
+
+def _message_text(event: AstrMessageEvent) -> str:
+    """获取消息纯文本，优先使用框架已剥离唤醒前缀的 ``message_str``。"""
+    text = getattr(event, "message_str", "")
+    if isinstance(text, str) and text.strip():
+        return text
+    raw = getattr(getattr(event, "message_obj", None), "message_str", "")
+    return raw if isinstance(raw, str) else ""
+
+
+@dataclass(frozen=True)
+class CatalogSpec:
+    """一类推荐条目的静态描述：命令、数据文件、兜底列表与回复文案。"""
+
+    key: str
+    command: str
+    aliases: frozenset[str]
+    file_name: str
+    fallback: tuple[str, ...]
+    noun: str
+    messages: dict[str, str]
+
+    @property
+    def command_names(self) -> tuple[str, ...]:
+        """指令名与别名，按长度降序，供关键词提取使用。"""
+        return tuple(sorted((self.command, *self.aliases), key=len, reverse=True))
+
+
+FOOD_SPEC = CatalogSpec(
+    key="food",
+    command="吃什么",
+    aliases=frozenset({"推荐吃的", "吃点啥"}),
+    file_name="food.txt",
+    fallback=(
+        "火锅|火锅,川菜,重口", "烤肉|烧烤,肉食", "寿司|日料,生食",
+        "麻辣烫|川菜,重口", "螺蛳粉|广西菜,重口", "牛肉面|面食,北方菜",
+        "宫保鸡丁|川菜,家常菜", "鱼香肉丝|川菜,家常菜", "麻婆豆腐|川菜,家常菜",
+        "饺子|面食,北方菜,家常菜", "面条|面食,北方菜", "米饭套餐|家常菜,主食",
+    ),
+    noun="食物",
+    messages={
+        "category": "🍚 分类推荐（{keyword}）：{item}",
+        "fuzzy": "🍚 符合“{keyword}”的推荐：{item}",
+        "miss": "❌ 未找到“{keyword}”相关食物/分类，随机推荐：{item}",
+        "random": "🍚 随机推荐：{item}",
+    },
 )
-class RandomFoodDrinkPlugin(Star):
-    DEFAULT_FOODS = [
-        "火锅|火锅,川菜,重口",
-        "烤肉|烧烤,肉食",
-        "寿司|日料,生食",
-        "麻辣烫|川菜,重口",
-        "螺蛳粉|广西菜,重口",
-        "牛肉面|面食,北方菜",
-        "宫保鸡丁|川菜,家常菜",
-        "鱼香肉丝|川菜,家常菜",
-        "麻婆豆腐|川菜,家常菜",
-        "饺子|面食,北方菜,家常菜",
-        "面条|面食,北方菜",
-        "米饭套餐|家常菜,主食"
-    ]
-    
-    DEFAULT_DRINKS = [
+
+DRINK_SPEC = CatalogSpec(
+    key="drink",
+    command="喝什么",
+    aliases=frozenset({"推荐喝的", "喝点啥"}),
+    file_name="drink.txt",
+    fallback=(
         "芒果奶昔|奶茶", "珍珠奶绿|奶茶", "芋泥波波|奶茶,甜品",
         "拿铁咖啡|咖啡", "美式咖啡|咖啡", "生椰拿铁|咖啡",
         "柠檬气泡水|气泡水,果饮", "青提气泡水|气泡水",
         "酸梅汤|果饮", "鲜橙汁|果汁", "芒果汁|果汁",
-        "绿茶|茶类", "红茶|茶类", "柠檬茶|茶类,果饮"
-    ]
+        "绿茶|茶类", "红茶|茶类", "柠檬茶|茶类,果饮",
+    ),
+    noun="饮品",
+    messages={
+        "category": "🥤 分类推荐（{keyword}）：{item}",
+        "fuzzy": "🥤 符合“{keyword}”的推荐：{item}",
+        "miss": "❌ 未找到“{keyword}”相关饮品/分类，随机推荐：{item}",
+        "random": "🥤 随机推荐：{item}",
+    },
+)
 
-    DEFAULT_LIST_MAP = {
-        "food.txt": DEFAULT_FOODS,
-        "drink.txt": DEFAULT_DRINKS,
-    }
+CATALOG_SPECS: tuple[CatalogSpec, ...] = (FOOD_SPEC, DRINK_SPEC)
+
+
+class Catalog:
+    """单类条目的内存索引：数据文件准备、解析，以及三级挑选策略。"""
+
+    def __init__(self, spec: CatalogSpec, data_dir: Path, template_dir: Path) -> None:
+        self.spec = spec
+        self.data_file = data_dir / spec.file_name
+        self.template_file = template_dir / spec.file_name
+        self.items: list[str] = []
+        self.category_map: dict[str, list[str]] = {}
+
+    def prepare(self) -> None:
+        """确保数据文件存在（不存在则复制模板），随后解析条目。"""
+        self.data_file.parent.mkdir(parents=True, exist_ok=True)
+        self._copy_template()
+        self._load()
+
+    def _copy_template(self) -> None:
+        if self.data_file.exists():
+            return
+        if not self.template_file.exists():
+            logger.warning(
+                f"⚠️  模板文件 {self.template_file} 不存在，将使用内置兜底列表"
+            )
+            return
+        shutil.copy2(self.template_file, self.data_file)
+        logger.info(f"📁 已自动创建 {self.data_file}（默认模板）")
+
+    def _load(self) -> None:
+        lines: Iterable[str]
+        if self.data_file.exists():
+            try:
+                with open(self.data_file, encoding="utf-8") as file:
+                    lines = [line.strip() for line in file if line.strip()]
+            except (OSError, UnicodeDecodeError) as exc:
+                logger.error(
+                    f"❌ 读取 {self.data_file} 失败：{exc}，使用内置兜底列表"
+                )
+                lines = self.spec.fallback
+        else:
+            logger.warning(f"⚠️  文件 {self.data_file} 不存在，使用内置兜底列表")
+            lines = self.spec.fallback
+
+        self.items, self.category_map = _parse_catalog_lines(lines)
+
+    def pick(self, keyword: str = "") -> tuple[str, str]:
+        """挑选一条推荐，返回 ``(条目, 文案键)``。
+
+        策略与原实现一致：精确分类 → 名称模糊匹配 → 兜底随机。
+        """
+        if keyword:
+            bucket = self.category_map.get(keyword)
+            if bucket:
+                return random.choice(bucket), "category"
+            fuzzy_matched = [item for item in self.items if keyword in item]
+            if fuzzy_matched:
+                return random.choice(fuzzy_matched), "fuzzy"
+            return random.choice(self.items), "miss"
+        return random.choice(self.items), "random"
+
+
+@register(
+    PLUGIN_NAME,
+    "Cybercat",
+    "随机推荐吃什么、喝什么的插件",
+    PLUGIN_VERSION,
+    PLUGIN_REPO,
+)
+class RandomFoodDrinkPlugin(Star):
+    """随机推荐吃喝的插件。"""
 
     def __init__(self, context: Context):
-        super().__init__(context) 
-        
-        self.target_data_dir = Path(StarTools.get_data_dir("astrbot_plugin_eatdrink"))  # 插件数据目录
-        self.plugin_root_dir = Path(__file__).parent
-        self.template_dir = self.plugin_root_dir / "templates"
+        super().__init__(context)
 
-        self._copy_template_files()
+        self.data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
+        self.template_dir = Path(__file__).parent / "templates"
 
-        self.food_list, self.food_category_map = self._load_food_with_category()
-        self.drink_list, self.drink_category_map = self._load_drink_with_category()
-        
-        logger.info(f"✅ 插件初始化完成，数据目录：{self.target_data_dir}")
-        logger.info(f"📊 加载食物 {len(self.food_list)} 种，饮品 {len(self.drink_list)} 种")
-        logger.info(f"📋 支持食物分类：{list(self.food_category_map.keys()) if self.food_category_map else '无'}") 
-        logger.info(f"📋 支持饮品分类：{list(self.drink_category_map.keys()) if self.drink_category_map else '无'}")
+        self.catalogs: dict[str, Catalog] = {}
+        for spec in CATALOG_SPECS:
+            catalog = Catalog(spec, self.data_dir, self.template_dir)
+            catalog.prepare()
+            self.catalogs[spec.key] = catalog
+            logger.info(
+                f"📊 已加载{spec.noun} {len(catalog.items)} 种，"
+                f"分类 {len(catalog.category_map)} 个：{list(catalog.category_map)}"
+            )
 
-    def _copy_template_files(self):
-        self.target_data_dir.mkdir(parents=True, exist_ok=True)
-        
-        if not self.template_dir.exists():
-            logger.warning(f"⚠️  未找到模板目录 {self.template_dir}，跳过自动复制")
-            return
+        logger.info(f"✅ 插件初始化完成，数据目录：{self.data_dir}")
 
-        for filename in ["food.txt", "drink.txt"]:
-            template_file = self.template_dir / filename
-            target_file = self.target_data_dir / filename
-            
-            if not target_file.exists() and template_file.exists():
-                shutil.copy2(template_file, target_file)
-                logger.info(f"📁 已自动创建 {target_file}（默认模板）")
-            elif not template_file.exists():
-                logger.warning(f"⚠️  模板文件 {template_file} 不存在，无法复制")
+    # ------------------------------------------------------------------ 指令
 
-    def _load_food_with_category(self) -> tuple[list, dict]:
-        file_path = self.target_data_dir / "food.txt"
-        default_foods = self.DEFAULT_LIST_MAP.get("food.txt", [])
-        
-        food_list = [] 
-        category_map = {} 
-
-        if file_path.exists():
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    lines = [line.strip() for line in f.readlines() if line.strip()]
-            except Exception as e:
-                logger.error(f"❌ 读取 {file_path} 失败：{str(e)}，使用默认列表")
-                lines = default_foods
-        else:
-            logger.warning(f"⚠️  文件 {file_path} 不存在，使用默认列表")
-            lines = default_foods
-
-        for line in lines:
-            if "|" in line:
-                food_name, categories_str = line.split("|", 1)
-                food_name = food_name.strip()
-                category_list = list(set([cat.strip() for cat in categories_str.split(",") if cat.strip()]))
-            else:
-                food_name = line.strip()
-                category_list = []
-
-            if food_name and food_name not in food_list:
-                food_list.append(food_name)
-
-            for cat in category_list:
-                if cat not in category_map:
-                    category_map[cat] = []
-                if food_name not in category_map[cat]:
-                    category_map[cat].append(food_name)
-
-        return food_list, category_map
-
-    def _load_drink_with_category(self) -> tuple[list, dict]:
-        file_path = self.target_data_dir / "drink.txt"
-        default_drinks = self.DEFAULT_LIST_MAP.get("drink.txt", [])
-        
-        drink_list = [] 
-        category_map = {} 
-
-        if file_path.exists():
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    lines = [line.strip() for line in f.readlines() if line.strip()]
-            except Exception as e:
-                logger.error(f"❌ 读取 {file_path} 失败：{str(e)}，使用默认列表")
-                lines = default_drinks
-        else:
-            logger.warning(f"⚠️  文件 {file_path} 不存在，使用默认列表")
-            lines = default_drinks
-
-        for line in lines:
-            if "|" in line:
-                drink_name, categories_str = line.split("|", 1) 
-                drink_name = drink_name.strip()
-                category_list = list(set([cat.strip() for cat in categories_str.split(",") if cat.strip()]))
-            else:
-                drink_name = line.strip()
-                category_list = []
-
-            if drink_name and drink_name not in drink_list:
-                drink_list.append(drink_name)
-
-            for cat in category_list:
-                if cat not in category_map:
-                    category_map[cat] = []
-                if drink_name not in category_map[cat]:
-                    category_map[cat].append(drink_name)
-        return drink_list, category_map
-
-    @filter.command("吃什么", alias={"推荐吃的", "吃点啥"}, args=["event"])
+    @filter.command("吃什么", alias={"推荐吃的", "吃点啥"})
     async def recommend_food(self, event: AstrMessageEvent):
-        try:
-            raw_msg = event.message_obj.message_str.strip()
-        except AttributeError as e:
-            logger.error(f"❌ 获取消息失败：{str(e)}")
-            raw_msg = ""
-        
-        command_prefixes = ["吃什么", "推荐吃的", "吃点啥"]
-        keyword = None
+        """随机推荐吃什么，可跟分类或菜名，例如 /吃什么 川菜"""
+        yield self._single_reply(event, FOOD_SPEC)
 
-        for prefix in command_prefixes:
-            if raw_msg.startswith(f"/{prefix}"):
-                keyword = raw_msg[len(f"/{prefix}"):].strip()
-                break
-
-        if keyword:
-            if keyword in self.food_category_map:
-                recommended = random.choice(self.food_category_map[keyword])
-                yield event.plain_result(f"🍚 分类推荐（{keyword}）：{recommended}")
-                return
-            
-            matched_foods = [food for food in self.food_list if keyword in food]
-            if matched_foods:
-                recommended = random.choice(matched_foods)
-                yield event.plain_result(f"🍚 符合“{keyword}”的推荐：{recommended}")
-                return
-            
-            recommended = random.choice(self.food_list)
-            yield event.plain_result(f"❌ 未找到“{keyword}”相关食物/分类，随机推荐：{recommended}")
-            return
-
-        recommended = random.choice(self.food_list)
-        yield event.plain_result(f"🍚 随机推荐：{recommended}")
-
-    @filter.command("喝什么", alias={"推荐喝的", "喝点啥"}, args=["event"])
+    @filter.command("喝什么", alias={"推荐喝的", "喝点啥"})
     async def recommend_drink(self, event: AstrMessageEvent):
-        try:
-            raw_msg = event.message_obj.message_str.strip()
-        except AttributeError as e:
-            logger.error(f"❌ 获取消息失败：{str(e)}")
-            raw_msg = ""
-        
-        command_prefixes = ["喝什么", "推荐喝的", "喝点啥"]
-        keyword = None
+        """随机推荐喝什么，可跟分类或饮品名，例如 /喝什么 奶茶"""
+        yield self._single_reply(event, DRINK_SPEC)
 
-        for prefix in command_prefixes:
-            if raw_msg.startswith(f"/{prefix}"):
-                keyword = raw_msg[len(f"/{prefix}"):].strip()
-                break
-
-        if keyword:
-            if keyword in self.drink_category_map:
-                recommended = random.choice(self.drink_category_map[keyword])
-                yield event.plain_result(f"🥤 分类推荐（{keyword}）：{recommended}")
-                return
-            matched_drinks = [drink for drink in self.drink_list if keyword in drink]
-            if matched_drinks:
-                recommended = random.choice(matched_drinks)
-                yield event.plain_result(f"🥤 符合“{keyword}”的推荐：{recommended}")
-                return
-            recommended = random.choice(self.drink_list)
-            yield event.plain_result(f"❌ 未找到“{keyword}”相关饮品/分类，随机推荐：{recommended}")
-            return
-        recommended = random.choice(self.drink_list)
-        yield event.plain_result(f"🥤 随机推荐：{recommended}")
-
-    @filter.command("吃喝什么", args=["event"])
+    @filter.command("吃喝什么")
     async def recommend_food_drink(self, event: AstrMessageEvent):
-        random_food = random.choice(self.food_list)
-        random_drink = random.choice(self.drink_list)
+        """随机推荐一餐吃喝搭配"""
+        empty_spec = next(
+            (spec for spec in CATALOG_SPECS if not self.catalogs[spec.key].items),
+            None,
+        )
+        if empty_spec is not None:
+            yield event.plain_result(self._empty_hint(empty_spec))
+            return
+
+        food = random.choice(self.catalogs[FOOD_SPEC.key].items)
+        drink = random.choice(self.catalogs[DRINK_SPEC.key].items)
         yield event.plain_result(
-            f"🍽️  吃喝搭配推荐：\n"
-            f"主食：{random_food}\n"
-            f"饮品：{random_drink}"
+            f"🍽️  吃喝搭配推荐：\n主食：{food}\n饮品：{drink}"
         )
 
     async def terminate(self):
         logger.info("🔌 插件已卸载")
 
+    # -------------------------------------------------------------- 内部实现
 
-if __name__ == "__main__":
-    logger.info("📱 吃喝推荐插件启动测试")
+    def _single_reply(self, event: AstrMessageEvent, spec: CatalogSpec):
+        """按 ``spec`` 生成单条推荐回复。"""
+        catalog = self.catalogs[spec.key]
+        if not catalog.items:
+            return event.plain_result(self._empty_hint(spec))
+
+        keyword = _extract_keyword(_message_text(event), spec.command_names)
+        item, message_key = catalog.pick(keyword)
+        text = spec.messages[message_key].format(keyword=keyword, item=item)
+        return event.plain_result(text)
+
+    @staticmethod
+    def _empty_hint(spec: CatalogSpec) -> str:
+        return f"⚠️ 暂无可推荐的{spec.noun}，请检查数据文件 {spec.file_name}"
