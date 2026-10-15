@@ -23,7 +23,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_eatdrink"
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.5.0"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_eatdrink"
 
 # 正常情况下 AstrBot 的 WakingCheckStage 已经剥离唤醒前缀，这里只做兜底，
@@ -216,6 +216,60 @@ DRINK_SPEC = CatalogSpec(
 CATALOG_SPECS: tuple[CatalogSpec, ...] = (FOOD_SPEC, DRINK_SPEC)
 
 
+# -------------------------------------------------------------- 配对规则
+
+
+@dataclass(frozen=True)
+class PairingRule:
+    """一条食物→饮品偏好的配对规则。
+
+    当所抽食物的分类与 ``food_categories`` 有任意交集时，
+    该规则贡献的 ``drink_categories`` 并集会被用作「/吃喝什么」的饮品候选池。
+    规则按声明顺序求并集；多条都匹配则合并（不互斥）。
+    """
+
+    food_categories: frozenset[str]
+    drink_categories: frozenset[str]
+
+
+# 默认配对规则：用户可按需调整顺序、阈值或直接重写文件。
+# 设计要点：
+#   1. 「重口/火锅/烧烤/油炸」配清润饮品，让吃辣吃油不腻；
+#   2. 「甜品/甜口/烘焙」配茶/咖啡/无糖，用微苦解甜腻；
+#   3. 「清淡/汤品/素食」配健康无负担饮品，避免用甜饮压过食材本味；
+#   4. 「早餐」配提神温升饮品（不含碳酸酒精）。
+# 顺序：更特定的信号前置，避免被清规则并集吃掉（这里用并集不冲突，顺序仅用于将来手动开关）。
+PAIRING_RULES: tuple[PairingRule, ...] = (
+    PairingRule(
+        frozenset({"火锅", "烧烤", "重口", "油炸", "生食", "麻辣烫"}),
+        frozenset({"茶类", "奶饮", "奶茶", "果汁", "果饮", "草本饮品", "冷饮"}),
+    ),
+    PairingRule(
+        frozenset({"甜品", "烘焙", "甜口", "酥脆"}),
+        frozenset({"茶类", "咖啡", "无糖"}),
+    ),
+    PairingRule(
+        frozenset({"清淡", "汤品", "素食", "养生", "健康", "轻食", "凉菜"}),
+        frozenset({"茶类", "无糖", "养生", "草本饮品", "健康", "酸奶"}),
+    ),
+    PairingRule(
+        frozenset({"早餐"}),
+        frozenset({"奶茶", "咖啡", "茶类", "奶饮", "果汁"}),
+    ),
+)
+
+
+def preferred_drink_categories(food_categories: frozenset[str]) -> frozenset[str]:
+    """根据食物分类集合求出应有的饮品偏好池；无规则命中时返回空集。"""
+    return frozenset().union(
+        *(
+            rule.drink_categories
+            for rule in PAIRING_RULES
+            if food_categories & rule.food_categories
+        )
+    )
+
+
 class Catalog:
     """单类条目的内存索引：数据文件准备、解析，以及三级挑选策略。"""
 
@@ -270,6 +324,32 @@ class Catalog:
         self._item_categories = [
             (item, frozenset(cats)) for item, cats in item_to_cats.items()
         ]
+
+    def category_set_of(self, item_name: str) -> frozenset[str]:
+        """根据条目名返回其分类集合，找不到或无分类时返回空集。
+
+        用于 ``/吃喝什么`` 时反向查询食物的分类，再交给配对规则。
+        """
+        for name, cats in self._item_categories:
+            if name == item_name:
+                return cats
+        return frozenset()
+
+    def pick_pool(self, preferred_categories: frozenset[str] = frozenset()) -> str:
+        """从 ``preferred_categories`` 与之有交集的条目中随机抽一条。
+
+        - 输入为空集 / 池为空 ⇒ 退回全量随机（与 ``pick`` 的兜底一致）。
+        - 不处理 keyword、不计算 message_key，留给调用方决定。
+        """
+        if preferred_categories:
+            pool = [
+                item
+                for item, cats in self._item_categories
+                if cats & preferred_categories
+            ]
+            if pool:
+                return random.choice(pool)
+        return random.choice(self.items)
 
     def pick(
         self, keyword: str = "", *, slot: MealSlot | None = None
@@ -349,7 +429,11 @@ class RandomFoodDrinkPlugin(Star):
 
     @filter.command("吃喝什么")
     async def recommend_food_drink(self, event: AstrMessageEvent):
-        """随机推荐一餐吃喝搭配"""
+        """随机推荐一餐吃喝搭配。
+
+        食物保持时间感知（深夜偏清淡）；饮品走「配对规则（PAIRING_RULES）」：
+        先按食物分类查表得出「应有饮品池」，无匹配退回全量。
+        """
         empty_spec = next(
             (spec for spec in CATALOG_SPECS if not self.catalogs[spec.key].items),
             None,
@@ -359,14 +443,20 @@ class RandomFoodDrinkPlugin(Star):
             return
 
         slot = current_meal_slot()
-        food, _ = self.catalogs[FOOD_SPEC.key].pick(slot=slot)
-        drink, _ = self.catalogs[DRINK_SPEC.key].pick(slot=slot)
+        food_catalog = self.catalogs[FOOD_SPEC.key]
+        drink_catalog = self.catalogs[DRINK_SPEC.key]
+
+        # 1. 食物：维持时间感知（深夜偏清淡）。
+        food, _ = food_catalog.pick(slot=slot)
+        # 2. 饮品：根据食物分类查配对规则 → 从偏好池抽，抽不到退回全量。
+        preferred = preferred_drink_categories(food_catalog.category_set_of(food))
+        drink = drink_catalog.pick_pool(preferred)
+
         lines = [
             "🍽️  吃喝搭配推荐：",
             f"主食：{food}",
             f"饮品：{drink}",
         ]
-        # 深夜时段统一追加温和提醒；搭配场景也覆盖。
         if slot.gentle_reminder:
             lines.append(slot.gentle_reminder)
         yield event.plain_result("\n".join(lines))
