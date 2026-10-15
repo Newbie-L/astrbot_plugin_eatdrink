@@ -3,7 +3,10 @@
 数据来源：插件数据目录下的 ``food.txt`` / ``drink.txt``，首次运行时由 ``templates/``
 自动复制生成。每行格式为 ``条目名|分类1,分类2``，分类部分可省略。
 
-对外指令与回复文案保持与 1.2.2 完全一致，仅内部结构做了等价重构。
+1.4.0 起：根据当前时间自动切换推荐策略——
+- 早餐时段优先 早餐 分类；
+- 正餐时段全量随机；
+- 深夜时段偏清淡、并附带温和提醒。
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ from __future__ import annotations
 import random
 import shutil
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -19,7 +23,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_eatdrink"
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.4.0"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_eatdrink"
 
 # 正常情况下 AstrBot 的 WakingCheckStage 已经剥离唤醒前缀，这里只做兜底，
@@ -78,6 +82,76 @@ def _message_text(event: AstrMessageEvent) -> str:
     return raw if isinstance(raw, str) else ""
 
 
+# ---------------------------------------------------------------- 时段配置
+
+
+@dataclass(frozen=True)
+class MealSlot:
+    """一段时段的推荐偏好与附加提示。
+
+    小时窗口支持跨午夜：当 ``hours_end < hours_start`` 时视为 ``[hours_start, 24) ∪ [0, hours_end)``，
+    例如 ``(22, 5)`` 即 22:00–次日 04:59。
+
+    - ``preferred_categories`` 为空 ⇒ 该时段不限制池子（用全量随机）。
+    - ``gentle_reminder`` 非空 ⇒ 选完条目后追加到文案尾部。
+    """
+
+    name: str
+    label: str
+    preferred_categories: frozenset[str] = frozenset()
+    gentle_reminder: str | None = None
+    hours_start: int = 0
+    hours_end: int = 24
+
+
+# 默认时段表。边界值用「小时」粒度，不绑定日期；测试可通过 ``datetime`` 注入。
+# 默认顺序也是兜底优先级（首个匹配的胜出）。
+MEAL_SLOTS: tuple[MealSlot, ...] = (
+    MealSlot(
+        name="breakfast",
+        label="🌅 早餐时段",
+        preferred_categories=frozenset({"早餐"}),
+        hours_start=5,
+        hours_end=10,
+    ),
+    MealSlot(
+        name="meal",
+        label="🍱 正餐时段",
+        hours_start=10,
+        hours_end=22,
+    ),
+    MealSlot(
+        name="late_night",
+        label="🌙 深夜时段",
+        # 跨夜窗口 22:00 → 次日 04:59。「过了十二点用户还问」也命中这里。
+        preferred_categories=frozenset({"清淡", "汤品"}),
+        gentle_reminder="温馨提示：夜深啦，少吃一点、清淡一点更健康哦~",
+        hours_start=22,
+        hours_end=5,
+    ),
+)
+
+
+def _in_window(hour: int, start: int, end: int) -> bool:
+    """判断 ``hour`` 是否落在 ``[start, end)`` 窗口内；``start > end`` 时视为跨夜。"""
+    if start <= end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def current_meal_slot(now: datetime | None = None) -> MealSlot:
+    """根据当前小时数确定所处时段；未匹配时回落到正餐（不限制池）。
+
+    接受可选 ``now`` 参数便于单元测试注入固定时刻；缺省取 ``datetime.now()``。
+    """
+    hour = (now or datetime.now()).hour
+    for slot in MEAL_SLOTS:
+        if _in_window(hour, slot.hours_start, slot.hours_end):
+            return slot
+    # 理论不会走到这里：MEAL_SLOTS 拼起来覆盖 [0, 24)，但兜底用正餐。
+    return next(slot for slot in MEAL_SLOTS if slot.name == "meal")
+
+
 @dataclass(frozen=True)
 class CatalogSpec:
     """一类推荐条目的静态描述：命令、数据文件、兜底列表与回复文案。"""
@@ -113,6 +187,7 @@ FOOD_SPEC = CatalogSpec(
         "fuzzy": "🍚 符合“{keyword}”的推荐：{item}",
         "miss": "❌ 未找到“{keyword}”相关食物/分类，随机推荐：{item}",
         "random": "🍚 随机推荐：{item}",
+        "late_night_random": "🌙 深夜推荐：{item}",
     },
 )
 
@@ -134,6 +209,7 @@ DRINK_SPEC = CatalogSpec(
         "fuzzy": "🥤 符合“{keyword}”的推荐：{item}",
         "miss": "❌ 未找到“{keyword}”相关饮品/分类，随机推荐：{item}",
         "random": "🥤 随机推荐：{item}",
+        "late_night_random": "🌙 深夜推荐：{item}",
     },
 )
 
@@ -149,6 +225,9 @@ class Catalog:
         self.template_file = template_dir / spec.file_name
         self.items: list[str] = []
         self.category_map: dict[str, list[str]] = {}
+        # 每个条目对应的分类集合（去重、空集合表示条目无分类），
+        # 供 ``pick`` 在无关键词时段偏好场景下过滤池子。
+        self._item_categories: list[tuple[str, frozenset[str]]] = []
 
     def prepare(self) -> None:
         """确保数据文件存在（不存在则复制模板），随后解析条目。"""
@@ -183,11 +262,26 @@ class Catalog:
             lines = self.spec.fallback
 
         self.items, self.category_map = _parse_catalog_lines(lines)
+        # 重建条目→分类的反向索引：遍历分类字典，把分类名拼到每个条目上。
+        item_to_cats: dict[str, set[str]] = {item: set() for item in self.items}
+        for category, bucket in self.category_map.items():
+            for item in bucket:
+                item_to_cats.setdefault(item, set()).add(category)
+        self._item_categories = [
+            (item, frozenset(cats)) for item, cats in item_to_cats.items()
+        ]
 
-    def pick(self, keyword: str = "") -> tuple[str, str]:
+    def pick(
+        self, keyword: str = "", *, slot: MealSlot | None = None
+    ) -> tuple[str, str]:
         """挑选一条推荐，返回 ``(条目, 文案键)``。
 
-        策略与原实现一致：精确分类 → 名称模糊匹配 → 兜底随机。
+        策略与原实现一致：精确分类 → 名称模糊匹配 → 兜底随机；
+        时段有偏好分类时，无关键词场景下优先从偏好池抽，无匹配再退回全量。
+
+        文案键 ``late_night_random`` 固定在「深夜时段且无关键词」时返回，
+        调用方拿到后拼接温和提醒。偏好池命中与否都共用此键——避免
+        抽到「清单淡汤」条目却仍走 ``random`` 文案让用户看不出是深夜。
         """
         if keyword:
             bucket = self.category_map.get(keyword)
@@ -197,7 +291,20 @@ class Catalog:
             if fuzzy_matched:
                 return random.choice(fuzzy_matched), "fuzzy"
             return random.choice(self.items), "miss"
-        return random.choice(self.items), "random"
+
+        pool = self.items
+        if slot and slot.preferred_categories:
+            biased_pool = [
+                item
+                for item, cats in self._item_categories
+                if cats & slot.preferred_categories
+            ]
+            if biased_pool:
+                pool = biased_pool
+
+        if slot is not None and slot.gentle_reminder is not None:
+            return random.choice(pool), "late_night_random"
+        return random.choice(pool), "random"
 
 
 @register(
@@ -251,11 +358,18 @@ class RandomFoodDrinkPlugin(Star):
             yield event.plain_result(self._empty_hint(empty_spec))
             return
 
-        food = random.choice(self.catalogs[FOOD_SPEC.key].items)
-        drink = random.choice(self.catalogs[DRINK_SPEC.key].items)
-        yield event.plain_result(
-            f"🍽️  吃喝搭配推荐：\n主食：{food}\n饮品：{drink}"
-        )
+        slot = current_meal_slot()
+        food, _ = self.catalogs[FOOD_SPEC.key].pick(slot=slot)
+        drink, _ = self.catalogs[DRINK_SPEC.key].pick(slot=slot)
+        lines = [
+            "🍽️  吃喝搭配推荐：",
+            f"主食：{food}",
+            f"饮品：{drink}",
+        ]
+        # 深夜时段统一追加温和提醒；搭配场景也覆盖。
+        if slot.gentle_reminder:
+            lines.append(slot.gentle_reminder)
+        yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
         logger.info("🔌 插件已卸载")
@@ -263,14 +377,24 @@ class RandomFoodDrinkPlugin(Star):
     # -------------------------------------------------------------- 内部实现
 
     def _single_reply(self, event: AstrMessageEvent, spec: CatalogSpec):
-        """按 ``spec`` 生成单条推荐回复。"""
+        """按 ``spec`` 生成单条推荐回复。
+
+        时段策略：
+        - 关键词命中分类 / 名称：走原有逻辑，时段不影响（用户明确表达优先）。
+        - 无关键词：先按 ``current_meal_slot()`` 的偏好池抽取，匹配不上退回全量。
+        - 深夜时段无关键词：回复末尾追加温和提醒。
+        """
         catalog = self.catalogs[spec.key]
         if not catalog.items:
             return event.plain_result(self._empty_hint(spec))
 
+        slot = current_meal_slot()
         keyword = _extract_keyword(_message_text(event), spec.command_names)
-        item, message_key = catalog.pick(keyword)
+        item, message_key = catalog.pick(keyword, slot=slot)
         text = spec.messages[message_key].format(keyword=keyword, item=item)
+        # 深夜无关键词：无论池子是否命中，都追加温和提醒。
+        if not keyword and slot.gentle_reminder:
+            text = f"{text}\n{slot.gentle_reminder}"
         return event.plain_result(text)
 
     @staticmethod
