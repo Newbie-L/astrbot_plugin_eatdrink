@@ -7,6 +7,11 @@
 - 早餐时段优先 早餐 分类；
 - 正餐时段全量随机；
 - 深夜时段偏清淡、并附带温和提醒。
+
+1.7.0 起：新增「彩蛋库」（``egg.txt``）——
+- 独立数据文件，条目**不参与随机推荐**，只有用户点名才命中；
+- 分类：福瑞（furry / 兽圈）、老公（帅气的男人）；
+- 食物 / 饮品库都查不到关键词时兜底查彩蛋库，并换用彩蛋专属文案。
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_eatdrink"
-PLUGIN_VERSION = "1.6.0"
+PLUGIN_VERSION = "1.7.0"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_eatdrink"
 
 # 正常情况下 AstrBot 的 WakingCheckStage 已经剥离唤醒前缀，这里只做兜底，
@@ -218,6 +223,32 @@ DRINK_SPEC = CatalogSpec(
     },
 )
 
+# 彩蛋库：独立于食物 / 饮品库，条目不参与随机推荐。
+# 单独成库而不是塞进 food.txt 的原因：
+#   1. 彩蛋条目是「名字」不是食物，混进主库会污染随机推荐池
+#      ——用户随手一句 /吃什么 可能收到一个人名；
+#   2. 混进主库还会被 /吃喝什么 的配对规则捞走，把彩蛋当正餐推荐；
+#   3. 独立文件方便用户自行增删，不必在几百行菜名里翻找。
+EGG_SPEC = CatalogSpec(
+    key="egg",
+    command="彩蛋",
+    aliases=frozenset(),
+    file_name="egg.txt",
+    fallback=(),
+    noun="彩蛋",
+    messages={
+        "category": "🎲 彩蛋推荐（{keyword}）：{item}",
+        "fuzzy": "🎲 彩蛋推荐（{keyword}）：{item}",
+    },
+)
+
+# 彩蛋分类的专属文案：不同分类换语气，免得和正经推荐串味。
+EGG_CATEGORY_MESSAGES: dict[str, str] = {
+    "福瑞": "🐾 福瑞推荐（{keyword}）：{item}",
+    "老公": "💘 老公推荐（{keyword}）：{item}",
+}
+EGG_DEFAULT_MESSAGE = "🎲 彩蛋推荐（{keyword}）：{item}"
+
 CATALOG_SPECS: tuple[CatalogSpec, ...] = (FOOD_SPEC, DRINK_SPEC)
 
 
@@ -369,6 +400,23 @@ class Catalog:
                 return random.choice(pool)
         return random.choice(self.items)
 
+    def lookup(self, keyword: str) -> tuple[str, str] | None:
+        """按关键词查一条：先精确匹配分类，再按名称模糊匹配。
+
+        与 :meth:`pick` 的关键区别：**无命中时返回 ``None``**，不兜底随机。
+        这样调用方可以在「主库没查到」时插入别的策略（例如改查彩蛋库），
+        而不是直接拿到一条和关键词毫无关系的随机推荐。
+        """
+        if not keyword:
+            return None
+        bucket = self.category_map.get(keyword)
+        if bucket:
+            return random.choice(bucket), "category"
+        fuzzy_matched = [item for item in self.items if keyword in item]
+        if fuzzy_matched:
+            return random.choice(fuzzy_matched), "fuzzy"
+        return None
+
     def pick(
         self, keyword: str = "", *, slot: MealSlot | None = None
     ) -> tuple[str, str]:
@@ -381,13 +429,10 @@ class Catalog:
         调用方拿到后拼接温和提醒。偏好池命中与否都共用此键——避免
         抽到「清单淡汤」条目却仍走 ``random`` 文案让用户看不出是深夜。
         """
+        hit = self.lookup(keyword)
+        if hit is not None:
+            return hit
         if keyword:
-            bucket = self.category_map.get(keyword)
-            if bucket:
-                return random.choice(bucket), "category"
-            fuzzy_matched = [item for item in self.items if keyword in item]
-            if fuzzy_matched:
-                return random.choice(fuzzy_matched), "fuzzy"
             return random.choice(self.items), "miss"
 
         pool = self.items
@@ -422,7 +467,7 @@ class RandomFoodDrinkPlugin(Star):
         self.template_dir = Path(__file__).parent / "templates"
 
         self.catalogs: dict[str, Catalog] = {}
-        for spec in CATALOG_SPECS:
+        for spec in (*CATALOG_SPECS, EGG_SPEC):
             catalog = Catalog(spec, self.data_dir, self.template_dir)
             catalog.prepare()
             self.catalogs[spec.key] = catalog
@@ -491,6 +536,9 @@ class RandomFoodDrinkPlugin(Star):
         - 关键词命中分类 / 名称：走原有逻辑，时段不影响（用户明确表达优先）。
         - 无关键词：先按 ``current_meal_slot()`` 的偏好池抽取，匹配不上退回全量。
         - 深夜时段无关键词：回复末尾追加温和提醒。
+
+        彩蛋兜底（v1.7.0）：主库（食物 / 饮品）查不到关键词时，再问一次彩蛋库——
+        命中「福瑞 / 老公」就用彩蛋专属文案；彩蛋库也没命中才退回随机推荐。
         """
         catalog = self.catalogs[spec.key]
         if not catalog.items:
@@ -498,12 +546,48 @@ class RandomFoodDrinkPlugin(Star):
 
         slot = current_meal_slot()
         keyword = _extract_keyword(_message_text(event), spec.command_names)
-        item, message_key = catalog.pick(keyword, slot=slot)
+
+        if keyword:
+            hit = catalog.lookup(keyword)
+            if hit is not None:
+                item, message_key = hit
+            else:
+                egg_text = self._egg_reply(keyword)
+                if egg_text is not None:
+                    return event.plain_result(egg_text)
+                item, message_key = random.choice(catalog.items), "miss"
+        else:
+            item, message_key = catalog.pick(slot=slot)
+
         text = spec.messages[message_key].format(keyword=keyword, item=item)
         # 深夜无关键词：无论池子是否命中，都追加温和提醒。
         if not keyword and slot.gentle_reminder:
             text = f"{text}\n{slot.gentle_reminder}"
         return event.plain_result(text)
+
+    def _egg_reply(self, keyword: str) -> str | None:
+        """查彩蛋库；命中则返回彩蛋文案，未命中返回 ``None``。
+
+        彩蛋库独立于主库，所以这里的条目永远不会出现在随机推荐里。
+        命中规则与主库一致：先精确匹配分类，再按名称模糊匹配。
+        """
+        catalog = self.catalogs.get(EGG_SPEC.key)
+        if catalog is None or not catalog.items:
+            return None
+
+        bucket = catalog.category_map.get(keyword)
+        if bucket:
+            item, category = random.choice(bucket), keyword
+        else:
+            fuzzy = [item for item in catalog.items if keyword in item]
+            if not fuzzy:
+                return None
+            item = random.choice(fuzzy)
+            cats = catalog.category_set_of(item) & set(EGG_CATEGORY_MESSAGES)
+            category = sorted(cats)[0] if cats else ""
+
+        template = EGG_CATEGORY_MESSAGES.get(category, EGG_DEFAULT_MESSAGE)
+        return template.format(keyword=keyword, item=item)
 
     @staticmethod
     def _empty_hint(spec: CatalogSpec) -> str:
