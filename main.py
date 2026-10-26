@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import random
-import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +22,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_eatdrink"
-PLUGIN_VERSION = "1.5.0"
+PLUGIN_VERSION = "1.6.0"
 PLUGIN_REPO = "https://github.com/Newbie-L/astrbot_plugin_eatdrink"
 
 # 正常情况下 AstrBot 的 WakingCheckStage 已经剥离唤醒前缀，这里只做兜底，
@@ -38,12 +37,18 @@ def _split_categories(raw: str) -> list[str]:
 
 
 def _parse_catalog_lines(lines: Iterable[str]) -> tuple[list[str], dict[str, list[str]]]:
-    """把数据行解析为 ``(条目列表, {分类: [条目, ...]})``。"""
+    """把数据行解析为 ``(条目列表, {分类: [条目, ...]})``。
+
+    空行与以 ``#`` 开头的注释行会被跳过——数据文件因此可以写分段说明。
+    """
     items: list[str] = []
     category_map: dict[str, list[str]] = {}
 
     for line in lines:
-        name, _, categories = line.partition("|")
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        name, _, categories = stripped.partition("|")
         name = name.strip()
         if not name:
             continue
@@ -297,7 +302,20 @@ class Catalog:
                 f"⚠️  模板文件 {self.template_file} 不存在，将使用内置兜底列表"
             )
             return
-        shutil.copy2(self.template_file, self.data_file)
+        # 不用 shutil.copy2：它会连带复制源文件的权限位。若插件目录挂在
+        # 权限位显示为 000 的 FUSE / NAS / 网络盘上，复制出的数据文件会变成
+        # 000 权限 → 随后读取抛 PermissionError → 静默退回内置兜底列表。
+        # 这里按纯文本读写，不传播权限位。
+        try:
+            content = self.template_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.error(f"❌ 读取模板 {self.template_file} 失败：{exc}，使用内置兜底列表")
+            return
+        try:
+            self.data_file.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            logger.error(f"❌ 写入 {self.data_file} 失败：{exc}，使用内置兜底列表")
+            return
         logger.info(f"📁 已自动创建 {self.data_file}（默认模板）")
 
     def _load(self) -> None:
